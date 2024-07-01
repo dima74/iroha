@@ -11,8 +11,8 @@ use iroha::{
 };
 use iroha_config::parameters::actual::{Root as Config, Sumeragi, TrustedPeers};
 pub use iroha_core::state::StateReadOnly;
-use iroha_crypto::{ExposedPrivateKey, KeyPair};
-use iroha_data_model::{query::QueryOutputBox, ChainId};
+use iroha_crypto::{ExposedPrivateKey, Hash, HashOf, KeyPair};
+use iroha_data_model::{block::SignedBlock, query::QueryOutputBox, ChainId};
 use iroha_genesis::{GenesisBlock, RawGenesisTransaction};
 use iroha_logger::{warn, InstrumentFutures};
 use iroha_primitives::{
@@ -38,6 +38,8 @@ pub struct Network {
     ///
     /// [`BTreeMap`] is used in order to have deterministic order of peers.
     pub peers: BTreeMap<PeerId, Peer>,
+    /// Hash of genesis block. Needed for tests which e.g. add new peer.
+    pub genesis_hash: HashOf<SignedBlock>,
 }
 
 /// Get a standardized blockchain id
@@ -82,8 +84,6 @@ impl TestGenesis for GenesisBlock {
         extra_isi: impl IntoIterator<Item = InstructionBox>,
         topology: Vec<PeerId>,
     ) -> Self {
-        let cfg = Config::test();
-
         // TODO: Fix this somehow. Probably we need to make `kagami` a library (#3253).
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut genesis =
@@ -128,9 +128,6 @@ impl TestGenesis for GenesisBlock {
         }
 
         let genesis_key_pair = SAMPLE_GENESIS_ACCOUNT_KEYPAIR.clone();
-        if &cfg.genesis.public_key != genesis_key_pair.public_key() {
-            panic!("`Config::test` expected to use SAMPLE_GENESIS_ACCOUNT_KEYPAIR");
-        }
         genesis
             .with_topology(topology)
             .build_and_sign(&genesis_key_pair)
@@ -141,13 +138,13 @@ impl TestGenesis for GenesisBlock {
 pub struct NetworkBuilder {
     n_peers: u32,
     port: Option<u16>,
-    config: Option<Config>,
     /// Number of offline peers.
     /// By default all peers are online.
     offline_peers: Option<u32>,
     /// Number of peers which will submit genesis.
     /// By default only first peer submits genesis.
     genesis_peers: Option<u32>,
+    debug_force_soft_fork: bool,
 }
 
 impl NetworkBuilder {
@@ -156,15 +153,15 @@ impl NetworkBuilder {
         Self {
             n_peers,
             port,
-            config: None,
             offline_peers: None,
             genesis_peers: None,
+            debug_force_soft_fork: false,
         }
     }
 
     #[must_use]
-    pub fn with_config(mut self, config: Config) -> Self {
-        self.config = Some(config);
+    pub fn with_debug_force_soft_fork(mut self, value: bool) -> Self {
+        self.debug_force_soft_fork = value;
         self
     }
 
@@ -187,10 +184,16 @@ impl NetworkBuilder {
         let (builders, mut peers) = self.prepare_peers();
 
         let peer_infos = self.generate_peer_infos();
-        let mut config = self.config.unwrap_or_else(Config::test);
         let topology = peers.iter().map(|peer| peer.id.clone()).collect::<Vec<_>>();
-        config.sumeragi.trusted_peers.value_mut().others = UniqueVec::from_iter(topology.clone());
-        let genesis_block = GenesisBlock::test(topology);
+        let genesis_block = GenesisBlock::test(topology.clone());
+        let genesis_hash = genesis_block.0.hash();
+
+        let mut config = Config::test(genesis_hash);
+        config.sumeragi.trusted_peers.value_mut().others = UniqueVec::from_iter(topology);
+        #[cfg(debug_assertions)]
+        {
+            config.sumeragi.debug_force_soft_fork = self.debug_force_soft_fork;
+        }
 
         let futures = FuturesUnordered::new();
         for ((builder, peer), peer_info) in builders
@@ -221,6 +224,7 @@ impl NetworkBuilder {
         Network {
             first_peer,
             peers: other_peers,
+            genesis_hash,
         }
     }
 
@@ -326,7 +330,7 @@ impl Network {
                 .api_address,
         );
 
-        let mut config = Config::test();
+        let mut config = Config::test(self.genesis_hash);
         config.sumeragi.trusted_peers.value_mut().others =
             UniqueVec::from_iter(self.peers().map(|peer| &peer.id).cloned());
 
@@ -640,7 +644,6 @@ impl PeerBuilder {
 
     /// Accept a peer and starts it.
     pub async fn start_with_peer(self, peer: &mut Peer) {
-        let config = self.config.unwrap_or_else(Config::test);
         let genesis = match self.genesis {
             WithGenesis::Default => {
                 let topology = vec![peer.id.clone()];
@@ -649,6 +652,12 @@ impl PeerBuilder {
             WithGenesis::None => None,
             WithGenesis::Has(genesis) => Some(genesis),
         };
+        let config = self.config.unwrap_or_else(|| {
+            let genesis = genesis
+                .as_ref()
+                .expect("Config should be provided if config is None");
+            Config::test(genesis.0.hash())
+        });
         let temp_dir = self
             .temp_dir
             .unwrap_or_else(|| Arc::new(TempDir::new().expect("Failed to create temp dir.")));
@@ -695,7 +704,7 @@ pub trait TestRuntime {
 /// Peer configuration mocking trait.
 pub trait TestConfig {
     /// Creates test configuration
-    fn test() -> Self;
+    fn test(genesis_hash: HashOf<SignedBlock>) -> Self;
     /// Returns default pipeline time.
     fn pipeline_time() -> Duration;
     /// Returns default time between block sync requests
@@ -794,14 +803,14 @@ impl TestRuntime for Runtime {
 }
 
 impl TestConfig for Config {
-    fn test() -> Self {
+    fn test(genesis_hash: HashOf<SignedBlock>) -> Self {
         use iroha_config::base::toml::TomlSource;
 
         let mut raw = irohad::samples::get_config_toml(
             <_>::default(),
             get_chain_id(),
             get_key_pair(Signatory::Peer),
-            get_key_pair(Signatory::Genesis).public_key(),
+            genesis_hash,
         );
 
         let (public_key, private_key) = KeyPair::random().into_parts();
@@ -819,8 +828,12 @@ impl TestConfig for Config {
     }
 
     fn block_sync_gossip_time() -> Duration {
-        Self::test().block_sync.gossip_period
+        Self::test(dummy_genesis_hash()).block_sync.gossip_period
     }
+}
+
+fn dummy_genesis_hash() -> HashOf<SignedBlock> {
+    HashOf::from_untyped_unchecked(Hash::new([]))
 }
 
 // Increased timeout to prevent flaky tests
